@@ -33,7 +33,7 @@ class SingBox {
         json["inbounds"] = [
             [
                 "type": "tun",
-                "inet4_address": "192.168.43.176/30",
+                "inet4_address": "10.14.89.134/30",
                 "auto_route": true,
                 "mtu": mtu,
                 "sniff": true
