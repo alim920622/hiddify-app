@@ -1,0 +1,215 @@
+name: Build APK
+on:
+  workflow_call:
+    inputs:
+      upload-artifact:
+        type: boolean
+        default: true
+      tag-name:
+        type: string
+        default: "draft"
+      channel:
+        type: string
+        default: "dev"
+
+env:
+  IS_GITHUB_ACTIONS: 1
+  CHANNEL: "${{ inputs.channel }}"
+  FLUTTER_VERSION: '3.24.0'
+  NDK_VERSION: r26d
+  UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
+  TAG_NAME: "${{ inputs.tag-name }}"
+  TARGET_NAME_apk: "Hiddify-Android"
+  TARGET_NAME_aab: "Hiddify-Android"  # Keep this for potential AAB upload later
+
+
+jobs:
+  test:
+    outputs:
+      draftBuildCode: ${{ steps.draftBuildCode.outputs.datetime }}
+    runs-on: ubuntu-latest  # Use ubuntu-latest for tests, it's faster
+    steps:
+      - uses: actions/checkout@v3
+      - uses: subosito/flutter-action@v2.16.0 #issue with 2.13
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Prepare
+        run: make linux-prepare  # Assuming linux-prepare has common setup
+      - name: Test
+        run: flutter test
+
+      - name: make draftBuildCode
+        id: draftBuildCode
+        run: echo "::set-output name=datetime::$(date +'%d.%H.%M')"
+
+
+  build-apk:  # Renamed job for clarity
+    needs: test
+    permissions:
+      contents: read  #  Read is enough if you're only uploading artifacts
+      packages: write # required for uploading to GitHub Packages registry
+    runs-on: ubuntu-latest  # Use ubuntu-latest for Android builds
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2.16.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Setup Gradle 7.5
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 7.5  # Keep at 7.5 as specified
+
+      - name: Setup dependencies
+        run: make android-apk-install-dependencies # Create this make target
+
+      - name: Setup Android Signing Properties
+        if: ${{ inputs.upload-artifact }}  # Simplified condition
+        run: |
+          echo "${{ secrets.ANDROID_SIGNING_KEY }}" | base64 --decode > android/key.jks
+          echo "storeFile=$(pwd)/android/key.jks" > android/key.properties
+          echo "storePassword=${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}" >> android/key.properties
+          echo "keyPassword=${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}" >> android/key.properties
+          echo "keyAlias=${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}" >> android/key.properties
+
+
+      - name: Prepare for android-apk
+        run: make android-apk-prepare  # Create this make target
+
+      - name: Build android-apk
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}  # Keep Sentry if you use it
+        run: make android-apk-release  # Create this make target
+          
+      - name: Upload Debug Symbols
+        if: ${{ inputs.upload-artifact && inputs.tag-name != 'draft' }}
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          SENTRY_DIST: 'general'  #  'general' for APKs
+        run: |
+          dart pub global activate sentry_dart_plugin
+          dart run sentry_dart_plugin
+
+      - name: Copy to out Android APK
+        run: |
+          mkdir -p out  # Ensure 'out' directory exists
+          ls -R ./build/app/outputs  # Log output for debugging
+          cp ./build/app/outputs/flutter-apk/*arm64-v8a*.apk "out/${TARGET_NAME_apk}-arm64.apk" || echo "no arm64 apk"
+          cp ./build/app/outputs/flutter-apk/*armeabi-v7a*.apk "out/${TARGET_NAME_apk}-arm7.apk" || echo "no arm7 apk"
+          cp ./build/app/outputs/flutter-apk/*x86_64*.apk "out/${TARGET_NAME_apk}-x86_64.apk" || echo "no x64 apk"
+          cp ./build/app/outputs/flutter-apk/app-release.apk "out/${TARGET_NAME_apk}-universal.apk" || echo "no universal apk"
+
+      - name: Upload Artifact
+        if: env.UPLOAD_ARTIFACT == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk  #  Name the artifact clearly
+          path: ./out
+          retention-days: 1
+  update-draft:
+    permissions: write-all
+    if: ${{ inputs.upload-artifact }}
+    needs: [build-apk]
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk  #  Match the artifact name
+          path: ./out/
+
+      - name: Display Files Structure
+        run: ls -R
+        working-directory: ./out
+
+      - name: Delete Current Release Assets
+        uses: 8Mi-Tech/delete-release-assets-action@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: 'draft'
+          deleteOnlyFromDrafts: false
+          
+      - name: prepare_release_message
+        run: |
+          pip install gitchangelog pystache mustache markdown
+          prelease=$(curl --silent "https://api.github.com/repos/hiddify/hiddify-next/releases/latest" | grep -Po '"tag_name": "\K.*?(?=")')
+          current="${{ github.ref_name }}"
+          sed 's|RELEASE_TAG|${{ env.TAG_NAME }}|g' ./.github/release_message.md > release.md
+          echo -e "\n\n<details markdown=1><summary>All changes from $current to the latest commit:</summary>\n\n">>release.md
+          gitchangelog "${prelease}.." >> release.md  2>&1 || echo "Error in gitchangelog"
+          echo -e "\n\n</details>">>release.md
+      - name: Create or Update Draft Release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: ./out/*
+          name: 'draft'
+          tag_name: 'draft'
+          body_path: './release.md'
+          prerelease: true
+  upload-release:
+    permissions: write-all
+    if: ${{ inputs.upload-artifact && inputs.tag-name != 'draft' }}
+    needs: [build-apk]
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+        
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: ./out/
+          
+      - name: Display Files Structure
+        run: ls -R
+        working-directory: ./out
+
+      - name: prepare_release_message
+        run: |
+          sed 's|RELEASE_TAG|${{ env.TAG_NAME }}|g' ./.github/release_message.md >> release.md
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v1
+        if: ${{ success() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # prerelease: ${{ env.CHANNEL == 'dev' }}
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          body_path: './release.md'
+          files: ./out/*
+
+# Removed upload-to-testflight and other platform-specific jobs
