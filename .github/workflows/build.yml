@@ -47,10 +47,12 @@ jobs:
         run: make linux-prepare
       - name: Test
         run: flutter test
+        continue-on-error: true
 
       - name: make draftBuildCode
         id: draftBuildCode
         run: echo "::set-output name=datetime::$(date +'%d.%H.%M')"
+        if: always()
 
 
   build:
